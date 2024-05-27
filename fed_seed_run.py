@@ -21,7 +21,7 @@ device = sys.argv[6]
 
 device_idx_list = [idx for idx in device.split(",")]
 n_gpu = len(device_idx_list)
-world_size = 3
+world_size = 6
 logger.info(f"world_size is {world_size}")
 
 if task_name == "conll":
@@ -41,12 +41,21 @@ logger.info(f"{task_name}'s max_seq is {max_seq}")
 
 cmds = []
 gpu_index = 0
-for tuning_type in ['lora', 'prefix', 'adapter', 'bitfit', 'fine-tuning']:
+# for tuning_type in ['lora', 'prefix', 'adapter', 'bitfit', 'fine-tuning']:
+
+for tuning_type in ['lora']:
+# for tuning_type in ['lora']:
     hyper_parameter = fed_best_hyperparameter[task_name][tuning_type]
-    # hyper_parameter["seed"] = [42]
-    hyper_parameter["num_train_epochs"] = [1]
-    # hyper_parameter["alpha"] = [0.1, 10.0]
-    # hyper_parameter["sample"] = [0.2, 0.3, 0.4]
+    print(f"hyper_parameter --> {hyper_parameter}")
+    # hyper_parameter["seed"] = [51]
+    # import numpy as np
+    # hyper_parameter["seed"] = [np.random.randint(1,999)]
+
+    hyper_parameter["num_train_epochs"] = [1.0]
+    hyper_parameter["alpha"] = [0.1, 1.0, 10.0]
+    # hyper_parameter["alpha"] = [10.0]
+    hyper_parameter["sample"] = [1.0]
+    # hyper_parameter["clients_num"] = [10]
     for parameter in it.product(*list(hyper_parameter.values())):
         specific_parameter_dict = {key: parameter[list(hyper_parameter.keys()).index(key)]
                                 for key in list(hyper_parameter.keys())}
@@ -89,6 +98,9 @@ for tuning_type in ['lora', 'prefix', 'adapter', 'bitfit', 'fine-tuning']:
         gpu_index += 1
         cmds.append(one_cmd)
 
+# for cmd in one_cmd_list:
+#     print(cmd)
+# exit(0)
 run_process("sleep 3s")
 logger.warning(f"run {len(cmds)} seed-ablation tasks for roberta_{task_name}_{tuning_type}")
 

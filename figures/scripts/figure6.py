@@ -52,7 +52,8 @@ def plot_pairwise_distance(data_names):
                 for key, value in dict(zip(unique, counts)).items():
                     probability_array[key] = value
                 client_data_distribution.append(probability_array)
-
+                # print(f"data = {data_name} alpha = {alpha} client = {client_idx} --> {probability_array}")
+            
             heat_map_data = np.zeros((client_num, client_num))
             pdf_data = []
             for i in range(client_num):
