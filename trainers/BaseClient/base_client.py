@@ -14,7 +14,7 @@ from fedlab.utils import MessageCode, SerializationTool
 from fedlab.core.client.trainer import ClientTrainer
 from fedlab.core.client.manager import PassiveClientManager
 from fedlab.core.client.manager import ORDINARY_TRAINER, SERIAL_TRAINER
-
+from fedlab.core.server.handler import Aggregators
 
 class BaseClientTrainer(ClientTrainer, ABC):
     def __init__(self, model, train_dataset, valid_dataset):
@@ -102,6 +102,141 @@ class BaseClientTrainer(ClientTrainer, ABC):
                 self.logger.critical(f"local stop early in {epoch}")
                 break
 
+    def _train_alone_with_position(self, idx: int, model_parameters: torch.Tensor, position = "all",*args, **kwargs):
+        """local training for Client"""
+
+        train_loader = self._get_dataloader(dataset=self.train_dataset, client_id=idx)
+        if model_parameters is not None:
+            SerializationTool.deserialize_model(self._model, model_parameters)
+        
+        cnt = 0
+        if position == "all":
+            pass
+        elif position == "shallow": # 0, 1, 2, 3 --> cnt [0, 15]
+            for layer, para in self._model.named_parameters():
+                if 'lora' in layer:
+                    if cnt > 15:
+                        para.requires_grad = False
+                    cnt += 1
+        elif position == "medium": # 4, 5, 6, 7 cnt [16, 31]
+            for layer, para in self._model.named_parameters():
+                if 'lora' in layer:
+                    if cnt < 16 or cnt > 31:
+                        para.requires_grad = False
+                    cnt += 1
+        elif position == "deep": # 8, 9, 10, 11 [32, 47]
+            for layer, para in self._model.named_parameters():
+                if 'lora' in layer:
+                    if cnt < 32:
+                        para.requires_grad = False
+                    cnt += 1
+
+        for layer, para in self._model.named_parameters():
+            if para.requires_grad:
+                self.logger.info(layer)
+        
+        # build optimizer,scheduler,loss
+        optimizer, scheduler = self._build_optimizer(self._model, len(train_loader))
+        self._model, optimizer = self._mixed_train_model(self._model, optimizer)
+        self._build_loss()
+
+        for epoch in range(0, int(self.training_config.num_train_epochs)):
+            self._on_epoch_begin()
+            self._on_epoch(train_loader, optimizer, scheduler)
+            self._on_epoch_end(idx)
+            if self.federated_config.pson and self.stop_early:
+                self.logger.critical(f"local stop early in {epoch}")
+                break
+
+    def _train_alone_with_range(self, idx: int, model_parameters: torch.Tensor, start: int, end: int, *args, **kwargs):
+        """local training for Client"""
+
+        train_loader = self._get_dataloader(dataset=self.train_dataset, client_id=idx)
+        if model_parameters is not None:
+            SerializationTool.deserialize_model(self._model, model_parameters)
+        #########################################################
+        group2depth = {
+            7: 3,
+            1: 4,
+            9: 5,
+            8: 6,
+            5: 7,
+            6: 8,
+            3: 9,
+            10: 10,
+            2: 11,
+            4:12
+        }
+        group2depth2 = {
+            7: 12,
+            1: 11,
+            9: 10,
+            8: 9,
+            5: 8,
+            6: 7,
+            3: 6,
+            10: 5,
+            2: 4,
+            4: 3
+        }
+        group2depth3 = {
+            7: 7,
+            1: 7,
+            9: 7,
+            8: 7,
+            5: 7,
+            6: 7,
+            3: 7,
+            10: 7,
+            2: 7,
+            4: 7
+        }
+        def id2group(id):
+            return id // 10 + 1
+        
+        # self.logger.info(f"lora depth --> {group2depth[id2group(idx)]}")
+
+        # group = True
+        # if group:
+        #     min_lora_idx = 12 - group2depth3[id2group(idx)]
+        # else:
+        #     min_lora_idx = idx % 10
+        
+        # !!!!!
+        min_lora_idx = 0
+        
+        # lora_layer_idx = [f"layer.{11 - i}" for i in range(group2depth[id2group(idx)])]
+        # self.logger.info(f"client {idx} min_lora_idx --> {min_lora_idx}")
+
+        # self.logger.info(f"before set depth")
+        # for layer, para in self._model.named_parameters():
+        #     if para.requires_grad:
+        #         self.logger.info(layer)
+
+        for layer, para in self._model.named_parameters():
+            if para.requires_grad and "lora" in layer:
+                if int(layer.split('.')[4]) < min_lora_idx:
+                    para.requires_grad = False 
+
+        # self.logger.info(f"after set depth")
+        # for layer, para in self._model.named_parameters():
+        #     if para.requires_grad:
+        #         self.logger.info(layer)
+        #########################################################
+
+        # build optimizer,scheduler,loss
+        optimizer, scheduler = self._build_optimizer(self._model, len(train_loader))
+        self._model, optimizer = self._mixed_train_model(self._model, optimizer)
+        self._build_loss()
+
+        for epoch in range(0, int(self.training_config.num_train_epochs)):
+            self._on_epoch_begin()
+            self._on_epoch_with_range(train_loader, optimizer, scheduler, start, end)
+            self._on_epoch_end(idx)
+            if self.federated_config.pson and self.stop_early:
+                self.logger.critical(f"local stop early in {epoch}")
+                break
+
     def _get_dataloader(self, dataset, client_id: int):
         """Get :class:`DataLoader` for ``client_id``."""
         if isinstance(dataset, dict):
@@ -113,7 +248,9 @@ class BaseClientTrainer(ClientTrainer, ABC):
     def local_process(self, id_list: List, payload: List):
         """local process for Federated Learning"""
         model_parameters = payload[0]
-        self.param_list = self.fed_train(model_parameters, id_list)
+        # self.param_list = self.fed_train(model_parameters, id_list)
+        self.param_list = self.fed_train_with_position(model_parameters, id_list)
+        # self.param_list = self.fed_train_with_group_aggregation(model_parameters, id_list)
         return self.param_list
 
     def fed_train(self, model_parameters: torch.Tensor, id_list: List):
@@ -127,6 +264,40 @@ class BaseClientTrainer(ClientTrainer, ABC):
             param_list.append(self.model_parameters)
 
         return param_list
+    
+    def fed_train_with_position(self, model_parameters: torch.Tensor, id_list: List):
+        param_list = []
+
+        for idx in id_list:
+            self._train_alone_with_position(
+                idx=idx,
+                model_parameters=model_parameters,
+                position="deep" # "shallow, medium, deep, all"
+            )
+            param_list.append(self.model_parameters)
+
+        return param_list
+
+    def fed_train_with_group_aggregation(self, model_parameters: torch.Tensor, id_list: List):
+        param_list = []
+
+        my_step = 163
+        end = 325
+        for start in range(0, end, my_step):
+            for idx in id_list:
+                self._train_alone_with_range(
+                    idx=idx,
+                    model_parameters=model_parameters,
+                    start=start,
+                    end=start + my_step,
+                )
+                param_list.append(self.model_parameters)
+            model_parameters = Aggregators.fedavg_aggregate(param_list) # group 2
+            if start + my_step < end:
+                param_list = []
+
+        return param_list
+
 
     def cen_train(self, *args):
         self._train_alone(
@@ -236,6 +407,60 @@ class BaseClientTrainer(ClientTrainer, ABC):
         for step, batch in enumerate(train_loader):
             # if step >= 2:
             #     break
+            self._model.train()
+            batch = tuple(t.to(self.device) for t in batch)
+            inputs = {'input_ids': batch[0],
+                      'attention_mask': batch[1],
+                      'labels': batch[3]
+                      }
+            label = inputs['labels']
+            if self.model_config.model_type != 'distilbert' or self.model_config.model_type != 'roberta':
+                # XLM, DistilBERT and RoBERTa don't use segment_ids
+                inputs['token_type_ids'] = batch[2] \
+                    if self.model_config.model_type in ['bert', 'xlnet'] else None
+            outputs = self._model(inputs)
+
+            loss, logits = outputs[:2]
+            _, predicted = torch.max(logits, 1)
+
+            optimizer.zero_grad()
+            if self.training_config.n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu parallel training
+            if self.training_config.gradient_accumulation_steps > 1:
+                loss = loss / self.training_config.gradient_accumulation_steps
+
+            if self.training_config.fp16:
+                try:
+                    from apex import amp
+                except ImportError:
+                    raise ImportError(
+                        "Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+
+            self.tr_loss += loss.item()
+            if (step + 1) % self.training_config.gradient_accumulation_steps == 0:
+                if self.training_config.fp16:
+                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), self.training_config.max_grad_norm)
+                else:
+                    torch.nn.utils.clip_grad_norm_(self._model.parameters(), self.training_config.max_grad_norm)
+
+                optimizer.step()
+                scheduler.step()  # Update learning rate schedule
+
+                self.global_step += 1
+
+            self.total += label.size(0)
+            if self.model_config.model_output_mode == "seq_classification":
+                self.correct += (predicted == label).sum().item()
+
+    def _on_epoch_with_range(self, train_loader, optimizer, scheduler, start ,end):
+        for step, batch in enumerate(train_loader):
+            if step < start or step >= end:
+                continue
             self._model.train()
             batch = tuple(t.to(self.device) for t in batch)
             inputs = {'input_ids': batch[0],

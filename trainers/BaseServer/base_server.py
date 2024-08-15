@@ -17,6 +17,8 @@ from fedlab.utils import MessageCode
 from fedlab.core.coordinator import Coordinator
 
 
+import wandb
+
 class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
     def __init__(self, model, valid_data, test_data):
 
@@ -49,6 +51,7 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
         #  metrics & eval
         self._build_metric()
         self._build_eval()
+        self._setup_wandb()
         self.global_valid_best_metric = \
             float("inf") if self.training_config.is_decreased_valid_metric else -float("inf")
         self.global_test_best_metric = 0.0
@@ -91,6 +94,22 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
         self.metric = registry.get_metric_class(self.training_config.metric_name)(
             self.data_config.task_name, self.training_config.is_decreased_valid_metric
         )
+
+    def _setup_wandb(self):
+        from datetime import datetime
+
+        # 获取当前时间
+        now = datetime.now()
+
+        # 将时间格式化为字符串
+        time_str = now.strftime("%Y-%m-%d %H:%M")
+        name = f"client={self.federated_config.clients_num}_alpha={self.federated_config.alpha}_sap={self.federated_config.sample}_epoch={self.training_config.num_train_epochs}_" + time_str
+        # project_name = f"{self.data_config.task_name}-{self.model_config.model_type}"
+        # project_name = "client-num-test-qnli-roberta"
+        # project_name = "sfl-bert-qnli"
+        # project_name = "legend-qnli"
+        project_name = "legend-pre-sst-2-position"
+        wandb.init(project=project_name, name=name)
 
     def stop_condition(self) -> bool:
         return self.round >= self.global_round
@@ -216,6 +235,8 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
             }
             }
         )
+        wandb.log({f"{self.metric_name}": test_metric})
+        wandb.log({"Loss": test_loss})
 
 
 class BaseServerManager(ServerManager):
