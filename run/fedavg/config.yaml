@@ -5,7 +5,7 @@ data_config:
 
 federated_config:
   alpha: 10.0
-  clients_num: 100
+  clients_num: 10
   rounds: 100
   sample: 0.2
   test_rounds: False

@@ -7,17 +7,15 @@ from abc import ABC
 
 import torch
 
+import wandb
+from fedlab.core.coordinator import Coordinator
+from fedlab.core.server.handler import (Aggregators,
+                                        ParameterServerBackendHandler)
+from fedlab.core.server.manager import ServerManager
+from fedlab.utils import MessageCode
+from fedlab.utils.serialization import SerializationTool
 from utils.register import registry
 
-from fedlab.core.server.handler import Aggregators
-from fedlab.core.server.handler import ParameterServerBackendHandler
-from fedlab.core.server.manager import ServerManager
-from fedlab.utils.serialization import SerializationTool
-from fedlab.utils import MessageCode
-from fedlab.core.coordinator import Coordinator
-
-
-import wandb
 
 class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
     def __init__(self, model, valid_data, test_data):
@@ -35,10 +33,15 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
 
         self.device = config.training_config.device
         self._model = model.to(self.device)
+        self._group_num = 2
+        
+        self._group_models = [model.to(self.device) for _ in range(self._group_num)]
 
         # basic setting
         self.client_num_in_total = config.federated_config.clients_num
         self.sample_ratio = config.federated_config.sample
+
+        self._group_size = self.client_num_in_total / self._group_num
 
         # client buffer
         self.client_buffer_cache = []
@@ -52,37 +55,47 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
         self._build_metric()
         self._build_eval()
         self._setup_wandb()
-        self.global_valid_best_metric = \
-            float("inf") if self.training_config.is_decreased_valid_metric else -float("inf")
+        self.global_valid_best_metric = (
+            float("inf")
+            if self.training_config.is_decreased_valid_metric
+            else -float("inf")
+        )
         self.global_test_best_metric = 0.0
         self.metric_log = {
             "model_type": self.model_config.model_type,
             "clients_num": self.federated_config.clients_num,
-            "alpha": self.federated_config.alpha, "task": self.data_config.task_name,
+            "alpha": self.federated_config.alpha,
+            "task": self.data_config.task_name,
             "fl_algorithm": self.federated_config.fl_algorithm,
             "info": f"{self.model_config.model_type}_{self.federated_config.fl_algorithm}_"
-                    f"{self.federated_config.clients_num}_{self.federated_config.alpha}",
-            "logs": []
+            f"{self.federated_config.clients_num}_{self.federated_config.alpha}",
+            "logs": [],
         }
         # metric line
         self.metric_name = self.metric.metric_name
         times = registry.get("run_time")
         if self.training_config.do_grid:
             grid_info = registry.get("grid_info")
-            self.metric_line = f"{times}_{self.model_config.model_type}_{self.training_config.tuning_type}_" \
-                               f"seed={self.training_config.seed}_rounds={self.federated_config.rounds}_" \
-                               f"cli={self.federated_config.clients_num}_alp={self.federated_config.alpha}_" \
-                               f"sap={self.federated_config.sample}_epo={self.training_config.num_train_epochs}_" \
-                               f"lr={self.training_config.learning_rate}_{grid_info}_"
+            self.metric_line = (
+                f"{times}_{self.model_config.model_type}_{self.training_config.tuning_type}_"
+                f"seed={self.training_config.seed}_rounds={self.federated_config.rounds}_"
+                f"cli={self.federated_config.clients_num}_alp={self.federated_config.alpha}_"
+                f"sap={self.federated_config.sample}_epo={self.training_config.num_train_epochs}_"
+                f"lr={self.training_config.learning_rate}_{grid_info}_"
+            )
         else:
-            self.metric_line = f"{times}_{self.model_config.model_type}_{self.training_config.tuning_type}_" \
-                               f"seed={self.training_config.seed}_rounds={self.federated_config.rounds}_" \
-                               f"cli={self.federated_config.clients_num}_alp={self.federated_config.alpha}_" \
-                               f"sap={self.federated_config.sample}_lr={self.training_config.learning_rate}_" \
-                               f"epo={self.training_config.num_train_epochs}_"
+            self.metric_line = (
+                f"{times}_{self.model_config.model_type}_{self.training_config.tuning_type}_"
+                f"seed={self.training_config.seed}_rounds={self.federated_config.rounds}_"
+                f"cli={self.federated_config.clients_num}_alp={self.federated_config.alpha}_"
+                f"sap={self.federated_config.sample}_lr={self.training_config.learning_rate}_"
+                f"epo={self.training_config.num_train_epochs}_"
+            )
         # global model
         self.glo_save_file = os.path.join(
-            self.training_config.checkpoint_dir, f"{times}_{self.model_config.model_type}.pth")
+            self.training_config.checkpoint_dir,
+            f"{times}_{self.model_config.model_type}.pth",
+        )
         self.best_glo_params = None
 
     def _build_eval(self):
@@ -103,12 +116,16 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
 
         # 将时间格式化为字符串
         time_str = now.strftime("%Y-%m-%d %H:%M")
-        name = f"client={self.federated_config.clients_num}_alpha={self.federated_config.alpha}_sap={self.federated_config.sample}_epoch={self.training_config.num_train_epochs}_" + time_str
+        name = (
+            f"client={self.federated_config.clients_num}_alpha={self.federated_config.alpha}_sap={self.federated_config.sample}_epoch={self.training_config.num_train_epochs}_"
+            + time_str
+        )
         # project_name = f"{self.data_config.task_name}-{self.model_config.model_type}"
         # project_name = "client-num-test-qnli-roberta"
         # project_name = "sfl-bert-qnli"
         # project_name = "legend-qnli"
-        project_name = "legend-pre-sst-2-position"
+        # project_name = "legend-pre-sst-2-position"
+        project_name = "non-iid-fedlora-local-training-interval"
         wandb.init(project=project_name, name=name)
 
     def stop_condition(self) -> bool:
@@ -116,11 +133,17 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
 
     def sample_clients(self):
         selection = random.sample(
-            range(self.client_num_in_total),
-            self.client_num_per_round
+            range(self.client_num_in_total), self.client_num_per_round
         )
         return selection
 
+    def grouped_clients(self):
+        num_group = 2
+        group_sizes = [int(self.client_num_in_total / num_group) for _ in range(num_group)] # [5,5]
+        all_ids = [id for id in range(self.client_num_in_total)]
+        group_ids = [all_ids[i: i + group_sizes[0]] for i in range(0, len(all_ids), group_sizes[0])] # [[0,1,2,3,4], [5,6,7,8,9]]
+        return group_ids
+    
     def _update_global_model(self, payload):
         assert len(payload) > 0
 
@@ -149,8 +172,35 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
                     result = self.test_on_server()
                     if "test_rounds" not in self.metric_log:
                         self.metric_log["test_rounds"] = {}
-                    self.metric_log["test_rounds"][f"round_{self.round}"] \
-                        = result[self.metric_name]
+                    self.metric_log["test_rounds"][f"round_{self.round}"] = result[
+                        self.metric_name
+                    ]
+
+            # reset cache cnt
+            self.client_buffer_cache = []
+
+            return True  # return True to end this round.
+        else:
+            return False
+        
+    def _update_group_model(self, payload, group_id):
+        assert len(payload) > 0
+        if len(payload) == 1:
+            self.client_buffer_cache.append(payload[0].clone())
+        else:
+            self.client_buffer_cache += payload  # serial trainer
+
+        assert len(self.client_buffer_cache) <= self._group_size
+
+        if len(self.client_buffer_cache) == self._group_size:
+            model_parameters_list = self.client_buffer_cache
+            self.logger.debug(
+                f"Model parameters aggregation, number of aggregation elements {len(model_parameters_list)}"
+            )
+
+            # use aggregator
+            serialized_parameters = Aggregators.fedavg_aggregate(model_parameters_list)
+            self._group_models[group_id] = serialized_parameters
 
             # reset cache cnt
             self.client_buffer_cache = []
@@ -159,10 +209,47 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
         else:
             return False
 
+    def _update_global_group_model(self):
+        assert len(self._group_models) == self._group_num
+
+        if len(self._group_models) == self._group_num:
+            model_parameters_list = self._group_models
+            self.logger.debug(
+                f"Model parameters aggregation, number of aggregation elements {len(model_parameters_list)}"
+            )
+
+            # use aggregator
+            serialized_parameters = Aggregators.fedavg_aggregate(model_parameters_list)
+            SerializationTool.deserialize_model(self._model, serialized_parameters)
+            self.round += 1
+
+            self.valid_on_server()
+
+            if self.federated_config.test_rounds:
+                if self.round % self.federated_config.log_test_len == 0:
+                    result = self.test_on_server()
+                    if "test_rounds" not in self.metric_log:
+                        self.metric_log["test_rounds"] = {}
+                    self.metric_log["test_rounds"][f"round_{self.round}"] = result[
+                        self.metric_name
+                    ]
+
+            # reset cache cnt
+            self.client_buffer_cache = []
+
+            return True  # return True to end this round.
+        else:
+            return False
+
+
     @property
     def client_num_per_round(self):
         return max(1, int(self.sample_ratio * self.client_num_in_total))
-
+    
+    @property
+    def client_num_of_group(self):
+        return self._group_num
+    
     @property
     def downlink_package(self):
         """Property for manager layer. BaseServer manager will call this property when activates clients."""
@@ -182,7 +269,7 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
             model=self._model,
             valid_dl=self.valid_data,
             model_type=self.model_config.model_type,
-            model_output_mode=self.model_config.model_output_mode
+            model_output_mode=self.model_config.model_output_mode,
         )
 
         self.on_round_end(result)
@@ -195,11 +282,13 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
             model=self._model,
             valid_dl=self.test_data,
             model_type=self.model_config.model_type,
-            model_output_mode=self.model_config.model_output_mode
+            model_output_mode=self.model_config.model_output_mode,
         )
 
-        self.logger.critical(f"task:{self.data_config.task_name}, Setting:{self.metric_log['info']}, "
-                             f"Test {self.metric_name.upper()}:{result[self.metric_name]:.3f}")
+        self.logger.critical(
+            f"task:{self.data_config.task_name}, Setting:{self.metric_log['info']}, "
+            f"Test {self.metric_name.upper()}:{result[self.metric_name]:.3f}"
+        )
 
         self.global_test_best_metric = result[self.metric_name]
 
@@ -216,23 +305,28 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
             self.global_valid_best_metric = test_metric
             self.best_glo_params = SerializationTool.serialize_model(self._model)
 
-        self.logger.info(f"{self.data_config.task_name}-{self.model_config.model_type} "
-                         f"train with client={self.federated_config.clients_num}_"
-                         f"alpha={self.federated_config.alpha}_"
-                         f"epoch={self.training_config.num_train_epochs}_"
-                         f"seed={self.training_config.seed}_"
-                         f"comm_round={self.federated_config.rounds}")
+        self.logger.info(
+            f"{self.data_config.task_name}-{self.model_config.model_type} "
+            f"train with client={self.federated_config.clients_num}_"
+            f"alpha={self.federated_config.alpha}_"
+            f"epoch={self.training_config.num_train_epochs}_"
+            f"seed={self.training_config.seed}_"
+            f"comm_round={self.federated_config.rounds}"
+        )
 
-        self.logger.debug(f"{self.federated_config.fl_algorithm} Eval "
-                          f"Round:{self.round}, Loss:{test_loss:.3f}, "
-                          f"Current {self.metric_name}:{test_metric:.3f}, "
-                          f"Best {self.metric_name}:{self.global_valid_best_metric:.3f}")
+        self.logger.debug(
+            f"{self.federated_config.fl_algorithm} Eval "
+            f"Round:{self.round}, Loss:{test_loss:.3f}, "
+            f"Current {self.metric_name}:{test_metric:.3f}, "
+            f"Best {self.metric_name}:{self.global_valid_best_metric:.3f}"
+        )
 
         self.metric_log["logs"].append(
-            {f"round_{self.round}": {
-                "loss": f"{test_loss:.3f}",
-                f"{self.metric.metric_name}": f"{test_metric:.3f}"
-            }
+            {
+                f"round_{self.round}": {
+                    "loss": f"{test_loss:.3f}",
+                    f"{self.metric.metric_name}": f"{test_metric:.3f}",
+                }
             }
         )
         wandb.log({f"{self.metric_name}": test_metric})
@@ -260,25 +354,38 @@ class BaseServerManager(ServerManager):
         for rank in range(1, self._network.world_size):
             _, _, content = self._network.recv(src=rank)
             rank_client_id_map[rank] = content[0].item()
-        self.coordinator = Coordinator(rank_client_id_map, mode='GLOBAL')  # mode='GLOBAL'
+        self.coordinator = Coordinator(
+            rank_client_id_map, mode="GLOBAL"
+        )  # mode='GLOBAL'
         if self._handler is not None:
             self._handler.client_num_in_total = self.coordinator.total
 
     def main_loop(self):
 
         while self._handler.if_stop is not True:
-            activate = threading.Thread(target=self.activate_clients)
-            activate.start()
+            # activate = threading.Thread(target=self.activate_clients)
+            # TODO:客户端分组
+            groups_ids = self._handler.grouped_clients() # list of list
+            step = 50
+            for gid, group_ids in enumerate(groups_ids): # group id list
+                # TODO:序列化训练每组模型
+                self.logger.info(f"######## start group {gid} with client {group_ids}")
+                activate = threading.Thread(
+                    target=self.activate_clients_in_a_group_with_steps,
+                    args=(group_ids, step)
+                )
+                activate.start()
 
-            while True:
-                sender_rank, message_code, payload = self._network.recv()
+                while True:
+                    sender_rank, message_code, payload = self._network.recv()
 
-                if message_code == MessageCode.ParameterUpdate:
-                    if self._handler._update_global_model(payload):
-                        break
-                else:
-                    raise Exception(
-                        "Unexpected message code {}".format(message_code))
+                    if message_code == MessageCode.ParameterUpdate:
+                        if self._handler._update_group_model(payload, gid):
+                            break
+                    else:
+                        raise Exception("Unexpected message code {}".format(message_code))
+                if group_ids == groups_ids[-1]:
+                    self._handler._update_global_group_model()
 
     def shutdown(self):
         """Shutdown stage."""
@@ -299,7 +406,23 @@ class BaseServerManager(ServerManager):
             self._network.send(
                 content=[id_list] + downlink_package,
                 message_code=MessageCode.ParameterUpdate,
-                dst=rank
+                dst=rank,
+            )
+
+    def activate_clients_in_a_group_with_steps(self, clients_this_round, step):
+
+        self.logger.info("BaseClient activation procedure")
+        rank_dict = self.coordinator.map_id_list(clients_this_round)
+        self.logger.info("BaseClient id list: {}".format(clients_this_round))
+
+        for rank, values in rank_dict.items():
+            downlink_package = self._handler.downlink_package
+            values += [step]
+            id_list_and_step = torch.Tensor(values).to(downlink_package[0].dtype)
+            self._network.send(
+                content=[id_list_and_step] + downlink_package,
+                message_code=MessageCode.ParameterUpdate,
+                dst=rank,
             )
 
     def shutdown_clients(self):
@@ -317,12 +440,12 @@ class BaseServerManager(ServerManager):
         for rank, values in rank_dict.items():
             downlink_package = self._handler.downlink_package
             id_list = torch.Tensor(values).to(downlink_package[0].dtype)
-            self._network.send(content=[id_list] + downlink_package,
-                               message_code=MessageCode.Exit,
-                               dst=rank)
+            self._network.send(
+                content=[id_list] + downlink_package,
+                message_code=MessageCode.Exit,
+                dst=rank,
+            )
 
         # wait for client exit feedback
-        _, message_code, _ = self._network.recv(
-            src=self._network.world_size - 1
-        )
+        _, message_code, _ = self._network.recv(src=self._network.world_size - 1)
         assert message_code == MessageCode.Exit
