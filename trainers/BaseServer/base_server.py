@@ -33,7 +33,7 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
 
         self.device = config.training_config.device
         self._model = model.to(self.device)
-        self._group_num = 2
+        self._group_num = 10
         
         self._group_models = [model.to(self.device) for _ in range(self._group_num)]
 
@@ -137,8 +137,7 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
         )
         return selection
 
-    def grouped_clients(self):
-        num_group = 2
+    def grouped_clients(self, num_group):
         group_sizes = [int(self.client_num_in_total / num_group) for _ in range(num_group)] # [5,5]
         all_ids = [id for id in range(self.client_num_in_total)]
         group_ids = [all_ids[i: i + group_sizes[0]] for i in range(0, len(all_ids), group_sizes[0])] # [[0,1,2,3,4], [5,6,7,8,9]]
@@ -241,13 +240,15 @@ class BaseSyncServerHandler(ParameterServerBackendHandler, ABC):
         else:
             return False
 
+    def downlink_package_of_group(self, gid):
+        return [self._group_models[gid]]
 
     @property
     def client_num_per_round(self):
         return max(1, int(self.sample_ratio * self.client_num_in_total))
     
     @property
-    def client_num_of_group(self):
+    def num_of_group(self):
         return self._group_num
     
     @property
@@ -365,27 +366,37 @@ class BaseServerManager(ServerManager):
         while self._handler.if_stop is not True:
             # activate = threading.Thread(target=self.activate_clients)
             # TODO:客户端分组
-            groups_ids = self._handler.grouped_clients() # list of list
-            step = 50
+            self.logger.info(f"########################################################## Round {self._handler.round} start.")
+            groups_ids = self._handler.grouped_clients(self._handler.num_of_group) # list of list
+            group_step = 2
+            local_step = 50
+            
             for gid, group_ids in enumerate(groups_ids): # group id list
-                # TODO:序列化训练每组模型
-                self.logger.info(f"######## start group {gid} with client {group_ids}")
-                activate = threading.Thread(
-                    target=self.activate_clients_in_a_group_with_steps,
-                    args=(group_ids, step)
-                )
-                activate.start()
+                # 序列化训练每组模型g_step轮，客户端上进行local_step轮
+                self.logger.info(f"########### start group {gid} with client {group_ids}")
+                first = True
+                for g_step in range(group_step):
+                    self.logger.info(f"###### group step = {g_step}, local step = {local_step}")
+                    activate = threading.Thread(
+                        target=self.activate_clients_in_a_group_with_steps,
+                        args=(group_ids, local_step, first, gid)
+                    )
+                    first = False
+                    activate.start()
 
-                while True:
-                    sender_rank, message_code, payload = self._network.recv()
+                    while True:
+                        sender_rank, message_code, payload = self._network.recv()
 
-                    if message_code == MessageCode.ParameterUpdate:
-                        if self._handler._update_group_model(payload, gid):
-                            break
-                    else:
-                        raise Exception("Unexpected message code {}".format(message_code))
-                if group_ids == groups_ids[-1]:
-                    self._handler._update_global_group_model()
+                        if message_code == MessageCode.ParameterUpdate:
+                            if self._handler._update_group_model(payload, gid):
+                                break
+                        else:
+                            raise Exception("Unexpected message code {}".format(message_code))
+                self.logger.info(f"########### end group {gid} with client {group_ids}")
+            self.logger.info(f"Global aggregation.")
+            self._handler._update_global_group_model()
+            self.logger.info(f"########################################################## Round {self._handler.round - 1} end.")
+            
 
     def shutdown(self):
         """Shutdown stage."""
@@ -409,15 +420,15 @@ class BaseServerManager(ServerManager):
                 dst=rank,
             )
 
-    def activate_clients_in_a_group_with_steps(self, clients_this_round, step):
+    def activate_clients_in_a_group_with_steps(self, clients_this_round, local_step, first, gid):
 
         self.logger.info("BaseClient activation procedure")
         rank_dict = self.coordinator.map_id_list(clients_this_round)
         self.logger.info("BaseClient id list: {}".format(clients_this_round))
 
         for rank, values in rank_dict.items():
-            downlink_package = self._handler.downlink_package
-            values += [step]
+            downlink_package = self._handler.downlink_package if first else self._handler.downlink_package_of_group(gid)
+            values += [local_step]
             id_list_and_step = torch.Tensor(values).to(downlink_package[0].dtype)
             self._network.send(
                 content=[id_list_and_step] + downlink_package,

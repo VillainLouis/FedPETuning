@@ -122,12 +122,16 @@ class BaseClientTrainer(ClientTrainer, ABC):
         **kwargs,
     ):
         """local training for Client"""
-        self.logger.info(f"############### step = {step}")
+        # self.logger.info(f"############### step = {step}")
         cur_index = client_data_indexes[idx]
         train_loader = self._get_dataloader(dataset=self.train_dataset, client_id=idx)
         train_iter = iter(train_loader)
         for i in range(cur_index):
-            next(train_iter)
+            try: 
+                next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                next(train_iter)
         if model_parameters is not None:
             SerializationTool.deserialize_model(self._model, model_parameters)
 
@@ -726,8 +730,8 @@ class BaseClientManager(PassiveClientManager, ABC):
             2. after receiving data, client start local model trainers procedure.
             3. client synchronizes with server actively.
         """
-        all_local_step = 209  # sst2:209
-        client_data_index_flag = True
+        all_local_step = 21  # sst2:209 (10), 21 (100)
+        client_idx_dict = dict()
         while True:
             sender_rank, message_code, payload = self._network.recv(src=0)
 
@@ -748,10 +752,8 @@ class BaseClientManager(PassiveClientManager, ABC):
                 step = id_list_and_step[-1]
 
                 # Initializing the worker local data indexes
-                if client_data_index_flag:
-                    client_data_index_flag = False
-                    client_idx_dict = dict()
-                    for id in id_list:
+                for id in id_list:
+                    if id not in client_idx_dict:
                         client_idx_dict[id] = 0
 
                 # check the trainer type
